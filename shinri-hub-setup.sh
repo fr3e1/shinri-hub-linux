@@ -209,7 +209,7 @@ case "$STEAM" in
   */snap/steam/*) STEAM_KIND=snap ;;
 esac
 info "Steam: $STEAM ($STEAM_KIND)"
-[ "$STEAM_KIND" = native ] || warn "$STEAM_KIND Steam is only partly supported; native Steam is recommended."
+[ "$STEAM_KIND" = flatpak ] && warn "Flatpak Steam is only partly supported; the native or Snap package is recommended."
 
 # ---------------------------------------------------------------- GMod, prefix, Proton, Steam user
 # Prints shell assignments: GMOD=, COMPAT=, PROTON=, ACTIVE_USER=
@@ -521,6 +521,12 @@ if ! pgrep -x steam >/dev/null && ! pgrep -f 'steamwebhelper' >/dev/null; then
 fi
 
 export STEAM_COMPAT_DATA_PATH="$COMPAT" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM"
+# Snap Steam runs with HOME=~/snap/steam/common; Proton's steam.exe finds Steam's Linux
+# library through $HOME/.steam/sdk64, which only exists there.
+[ "$STEAM_KIND" = snap ] && export HOME="$HOME/snap/steam/common"
+# The hub's UI doesn't need GPU acceleration, and Chromium's GPU process is unreliable
+# under Wine (crashes on VMs/some drivers -> "Failed to initialize: ERR_FAILED").
+if [ "${SHINRI_HUB_GPU:-0}" != 1 ]; then set -- --disable-gpu "$@"; fi
 export SteamAppId="$APPID" SteamGameId="$APPID"
 echo "--- $(date) launching $*" >>"$LOG"
 if [ "$STEAM_KIND" = flatpak ]; then
