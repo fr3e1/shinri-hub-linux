@@ -529,6 +529,16 @@ if [ "$STEAM_KIND" = flatpak ]; then
     --env=SteamAppId="$APPID" --env=SteamGameId="$APPID" \
     com.valvesoftware.Steam run cmd /c 'C:\Program Files\Shinri Hub Linux\launch.bat' "$@" >>"$LOG" 2>&1
 fi
+# If a previous hub is still shutting down, starting a new one at the same moment can fail
+# ("Failed to initialize: ERR_FAILED"). Wait (max 20s) for this prefix's Wine to exit, but
+# only when neither the hub nor the game is running (otherwise it would never exit).
+if ! pgrep -f '^C:.Program Files.Shinri Hub.Shinri Hub[.]exe' >/dev/null && \
+   ! pgrep -f 'shinri-trial[.]exe -steam|GarrysMod.*(gmod|hl2)[.]exe' >/dev/null; then
+  for ws in "$PROTON/files/bin/wineserver" "$PROTON/dist/bin/wineserver"; do
+    [ -x "$ws" ] && { WINEPREFIX="$COMPAT/pfx" timeout 20 "$ws" -w >/dev/null 2>&1 || true; break; }
+  done
+fi
+
 BAT='C:\Program Files\Shinri Hub Linux\launch.bat'
 # Run Proton inside the Steam Linux Runtime container like Steam does, so it doesn't depend on
 # the host's libraries (Debian/Fedora/Arch all differ). SHINRI_NO_RUNTIME=1 runs it directly.
