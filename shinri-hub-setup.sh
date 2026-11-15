@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # shinri-hub-setup.sh — install Shinri Trial Hub on Linux using Steam's Proton.
+# Temporary workaround until the official Linux/macOS hub is released; remove it
+# afterwards with --uninstall.
 #
 # Works on Debian/Ubuntu, Fedora, Arch and openSUSE (and their derivatives).
 # Requirements: Steam (distro package or Valve's .deb, logged in), Garry's Mod installed
@@ -23,7 +25,9 @@
 #   shinri-hub-setup.sh --installer FILE     install from a local "Shinri Hub Setup *.exe"
 #   shinri-hub-setup.sh --update             reinstall only if a newer hub version exists
 #   shinri-hub-setup.sh --check              only run the checks, change nothing
-#   shinri-hub-setup.sh --uninstall [--purge]  remove it (--purge also deletes hub settings and logs)
+#   shinri-hub-setup.sh --stop               close the hub and everything left in GMod's prefix
+#   shinri-hub-setup.sh --uninstall          remove everything this workaround added (asks first;
+#                                            --yes skips the prompt, --keep-data keeps hub data)
 #
 # Environment: SHINRI_WM_DECORATIONS=1 keeps window-manager title bars on Wine windows
 # (by default they're turned off in GMod's prefix to fix offset mouse clicks on KDE/Wayland).
@@ -50,14 +54,16 @@ info() { printf '    %s%s%s\n' "$c_dim" "$*" "$c_off"; }
 warn() { printf '%swarning:%s %s\n' "$c_warn" "$c_off" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
 
-MODE=install INSTALLER="" PURGE=0
+MODE=install INSTALLER="" KEEP_DATA=0 ASSUME_YES=${SHINRI_ASSUME_YES:-0}
 while [ $# -gt 0 ]; do
   case "$1" in
     --installer) INSTALLER="${2:?--installer needs a file}"; shift ;;
     --update) MODE=update ;;
     --check) MODE=check ;;
     --uninstall) MODE=uninstall ;;
-    --purge) PURGE=1 ;;
+    --stop) MODE=stop ;;
+    --keep-data) KEEP_DATA=1 ;;
+    -y|--yes) ASSUME_YES=1 ;;
     -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,"");print}' "$0"; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -68,29 +74,115 @@ done
 
 py() { python3 -I - "$@"; }
 
+# The hub's main process (not its --type= children or the tl.js tasklist helpers)
+hub_running() { pgrep -af '^C:.Program Files.Shinri Hub.Shinri Hub[.]exe' | grep -v -e '--type=' -e 'tl[.]js' >/dev/null; }
+game_running() { pgrep -f 'shinri-trial[.]exe -steam|GarrysMod.*(gmod|hl2|gmod_win64)[.]exe' >/dev/null; }
+
+lib_paths() { # Steam root -> its library folders, one per line (handles spaces in paths)
+  printf '%s\n' "$1"
+  sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$1/steamapps/libraryfolders.vdf" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- stop
+if [ "$MODE" = stop ]; then
+  [ -f "$CONF_DIR/config.sh" ] || die "not installed (no $CONF_DIR/config.sh)"
+  # shellcheck disable=SC1091
+  . "$CONF_DIR/config.sh"
+  game_running && die "Shinri Trial / Garry's Mod is running; quit the game first"
+  for ws in "$PROTON/files/bin/wineserver" "$PROTON/dist/bin/wineserver"; do
+    [ -x "$ws" ] && { WINEPREFIX="$PFX" timeout 20 "$ws" -k || true; break; }
+  done
+  sleep 2
+  if hub_running; then die "Shinri Hub is still running; quit it from its tray icon"; fi
+  say "Stopped Shinri Hub"; exit 0
+fi
+
 # ---------------------------------------------------------------- uninstall
+# Removes everything this workaround added, so nothing is left once an official Linux hub
+# exists. Steam, Garry's Mod and GMod's Proton prefix are left alone.
 if [ "$MODE" = uninstall ]; then
+  STEAM="" PFX="" PROTON="" COMPAT=""
   if [ -f "$CONF_DIR/config.sh" ]; then
     # shellcheck disable=SC1091
     . "$CONF_DIR/config.sh"
-    if pgrep -f '^C:.Program Files.Shinri Hub.Shinri Hub[.]exe' >/dev/null; then die "close Shinri Hub first"; fi
-    say "Removing hub files from the GMod prefix"
-    rm -rf -- "$PFX/drive_c/Program Files/Shinri Hub" "$PFX/drive_c/Program Files/Shinri Hub Linux"
-    for w in "$PROTON/files/bin/wine" "$PROTON/dist/bin/wine"; do
-      [ -x "$w" ] && { WINEPREFIX="$PFX" "$w" reg delete 'HKCU\Software\Wine\X11 Driver' /v Decorated /f >/dev/null 2>&1 || true; break; }
+  else
+    # No config (partial install?): look for GMod's prefix in the usual Steam libraries
+    for root in "$HOME/.local/share/Steam" "$HOME/.steam/debian-installation" "$HOME/.steam/steam" \
+                "$HOME/snap/steam/common/.local/share/Steam" "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+      [ -f "$root/steamapps/libraryfolders.vdf" ] || continue
+      STEAM=$root
+      while IFS= read -r lib; do
+        [ -d "$lib/steamapps/compatdata/4000/pfx" ] && { COMPAT="$lib/steamapps/compatdata/4000"; PFX="$COMPAT/pfx"; break; }
+      done < <(lib_paths "$root")
+      [ -n "$PFX" ] && break
     done
-    if [ "$PURGE" = 1 ]; then
+  fi
+  APPDATA="${PFX:+$PFX/drive_c/users/steamuser/AppData/Roaming}"
+  HOSTCOPY=""
+  if [ -n "$STEAM" ] && [ -f "$STEAM/steamapps/libraryfolders.vdf" ]; then
+    while IFS= read -r lib; do
+      [ -d "$lib/steamapps/common/Shinri Trial Host" ] && { HOSTCOPY="$lib/steamapps/common/Shinri Trial Host"; break; }
+    done < <(lib_paths "$STEAM")
+  fi
+
+  say "This removes the Shinri Hub Linux workaround:"
+  info "the hub and compatibility shim inside Garry's Mod's Proton prefix"
+  info "the launcher, app-menu entry, icon, st:// link handler, config and cache"
+  if [ "$KEEP_DATA" = 1 ]; then
+    info "(keeping hub settings/logs and the Shinri Trial Host game copy: --keep-data)"
+  else
+    info "hub settings and logs"
+    [ -n "$HOSTCOPY" ] && info "the hub's copy of GMod: $HOSTCOPY ($(du -sh "$HOSTCOPY" 2>/dev/null | cut -f1))"
+  fi
+  info "Steam, Garry's Mod and its Proton prefix are not touched."
+  if [ "$ASSUME_YES" != 1 ]; then
+    [ -t 0 ] || die "run with --yes to uninstall without a prompt"
+    read -r -p "    Continue? [y/N] " ans
+    case "$ans" in [Yy]*) ;; *) say "Nothing removed."; exit 0 ;; esac
+  fi
+
+  if [ -n "$PFX" ] && hub_running; then
+    game_running && die "quit Shinri Trial / Garry's Mod first, then rerun"
+    say "Closing Shinri Hub"
+    for ws in "$PROTON/files/bin/wineserver" "$PROTON/dist/bin/wineserver"; do
+      [ -x "$ws" ] && { WINEPREFIX="$PFX" timeout 20 "$ws" -k || true; break; }
+    done
+    sleep 2
+    hub_running && die "Shinri Hub is still running; quit it from its tray icon and rerun"
+  fi
+
+  if [ -n "$PFX" ]; then
+    say "Removing the hub from Garry's Mod's Proton prefix"
+    rm -rf -- "$PFX/drive_c/Program Files/Shinri Hub" "$PFX/drive_c/Program Files/Shinri Hub Linux"
+    # undo the registry values the shim set (Decorated, ActiveUser)
+    for w in "$PROTON/files/bin/wine" "$PROTON/dist/bin/wine"; do
+      [ -x "$w" ] || continue
+      WINEPREFIX="$PFX" "$w" reg delete 'HKCU\Software\Wine\X11 Driver' /v Decorated /f >/dev/null 2>&1 || true
+      WINEPREFIX="$PFX" "$w" reg delete 'HKCU\Software\Valve\Steam\ActiveProcess' /v ActiveUser /f >/dev/null 2>&1 || true
+      break
+    done
+    if [ "$KEEP_DATA" != 1 ]; then
       say "Removing hub settings and logs"
-      rm -rf -- "$PFX/drive_c/users/steamuser/AppData/Roaming/st-hub" \
-                "$PFX/drive_c/users/steamuser/AppData/Roaming/Shinri Trial"
+      rm -rf -- "$APPDATA/st-hub" "$APPDATA/Shinri Trial"
     fi
   else
-    warn "no config at $CONF_DIR/config.sh; removing only the launcher files"
+    warn "couldn't find Garry's Mod's Proton prefix; only removing the launcher files"
   fi
+  if [ "$KEEP_DATA" != 1 ] && [ -n "$HOSTCOPY" ]; then
+    say "Removing the hub's copy of GMod"
+    rm -rf -- "$HOSTCOPY"
+  fi
+
+  say "Removing the launcher, menu entry and config"
   rm -f -- "$BIN" "$DESKTOP" "$ICON"
+  MIMEAPPS="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
+  [ -f "$MIMEAPPS" ] && sed -i '/^x-scheme-handler\/st=shinri-hub\.desktop;*$/d; s/shinri-hub\.desktop;//g' "$MIMEAPPS"
   rm -rf -- "$DATA_DIR" "$CONF_DIR" "$CACHE_DIR"
-  command -v update-desktop-database >/dev/null && update-desktop-database -q "$(dirname "$DESKTOP")" 2>/dev/null || true
-  say "Uninstalled. (GMod and its Proton prefix were not touched.)"
+  command -v update-desktop-database >/dev/null && { update-desktop-database -q "$(dirname "$DESKTOP")" 2>/dev/null || true; }
+  command -v gtk-update-icon-cache >/dev/null && { gtk-update-icon-cache -q -t "$(dirname "$(dirname "$(dirname "$ICON")")")" 2>/dev/null || true; }
+  say "Shinri Hub Linux workaround removed."
+  info "If you only forced Proton for Garry's Mod for the hub, you can switch it back in Steam:"
+  info "Garry's Mod > Properties > Compatibility."
   exit 0
 fi
 
@@ -143,7 +235,7 @@ offer_install() { # tool, reason
     $DISTRO_NAME: install '${alts%%|*}' with your system's usual method (on immutable systems,
     e.g. rpm-ostree install, or run this script inside a distrobox), then rerun this script."
   fi
-  if [ "${SHINRI_ASSUME_YES:-0}" != 1 ]; then
+  if [ "$ASSUME_YES" != 1 ]; then
     if [ ! -t 0 ] || [ ! -t 1 ]; then die "$why
     Install it with:  $cmd
     then rerun this script."; fi
@@ -394,7 +486,7 @@ else
 fi
 
 # ---------------------------------------------------------------- extract
-if pgrep -f '^C:.Program Files.Shinri Hub.Shinri Hub[.]exe' >/dev/null; then die "Shinri Hub is running. Close it (also from the tray icon) and rerun."; fi
+if hub_running; then die "Shinri Hub is running. Close it (also from the tray icon), or run: $DATA_DIR/shinri-hub-setup.sh --stop"; fi
 say "Unpacking installer"
 TMP=$(mktemp -d "$CACHE_DIR/extract.XXXXXX")
 trap 'rm -rf -- "$TMP"' EXIT
@@ -428,7 +520,7 @@ cat > "$SHIM/tl.js" <<'EOF'
 // Generated by shinri-hub-setup.sh. Wine's tasklist writes UTF-16LE + LF when no console is
 // attached; Shinri Hub splits its output on CRLF and expects ANSI. Re-encode it.
 const { spawnSync } = require('child_process');
-const r = spawnSync('C:\\windows\\system32\\tasklist.exe', process.argv.slice(2), { windowsHide: true });
+const r = spawnSync('C:\\windows\\system32\\tasklist.exe', process.argv.slice(2), { windowsHide: true, timeout: 15000 });
 const conv = b => {
   if (!b || !b.length) return '';
   let s = (b.length > 1 && b.indexOf(0) !== -1) ? b.toString('utf16le') : b.toString('latin1');
@@ -495,6 +587,11 @@ notify() { command -v notify-send >/dev/null && notify-send -a "Shinri Hub" "Shi
 [ -f "$CONF" ] || { notify "Not set up. Run shinri-hub-setup.sh first."; exit 1; }
 # shellcheck disable=SC1090
 . "$CONF"
+case "${1:-}" in --uninstall|--stop|--update|--check) exec "$DATA/shinri-hub-setup.sh" "$@" ;; esac
+
+# The hub's main process (not its --type= children or the tl.js tasklist helpers)
+hub_running() { pgrep -af '^C:.Program Files.Shinri Hub.Shinri Hub[.]exe' | grep -v -e '--type=' -e 'tl[.]js' >/dev/null; }
+game_running() { pgrep -f 'shinri-trial[.]exe -steam|GarrysMod.*(gmod|hl2|gmod_win64)[.]exe' >/dev/null; }
 
 # Proton gets updated or removed by Steam sometimes, so re-detect it when it's gone
 if [ ! -x "$PROTON/proton" ]; then
@@ -504,7 +601,7 @@ if [ ! -x "$PROTON/proton" ]; then
 fi
 
 # The hub's built-in updater can't install under Wine, so update here instead
-if [ "${AUTO_UPDATE:-1}" = 1 ] && ! pgrep -f '^C:.Program Files.Shinri Hub.Shinri Hub[.]exe' >/dev/null; then
+if [ "${AUTO_UPDATE:-1}" = 1 ] && ! hub_running; then
   "$DATA/shinri-hub-setup.sh" --update >>"$LOG" 2>&1 || notify "Update check failed (continuing), see $LOG"
 fi
 
@@ -538,8 +635,8 @@ fi
 # If a previous hub is still shutting down, starting a new one at the same moment can fail
 # ("Failed to initialize: ERR_FAILED"). Wait (max 20s) for this prefix's Wine to exit, but
 # only when neither the hub nor the game is running (otherwise it would never exit).
-if ! pgrep -f '^C:.Program Files.Shinri Hub.Shinri Hub[.]exe' >/dev/null && \
-   ! pgrep -f 'shinri-trial[.]exe -steam|GarrysMod.*(gmod|hl2)[.]exe' >/dev/null; then
+if ! hub_running && \
+   ! game_running; then
   for ws in "$PROTON/files/bin/wineserver" "$PROTON/dist/bin/wineserver"; do
     [ -x "$ws" ] && { WINEPREFIX="$COMPAT/pfx" timeout 20 "$ws" -w >/dev/null 2>&1 || true; break; }
   done
