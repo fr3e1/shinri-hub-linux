@@ -625,11 +625,21 @@ export STEAM_COMPAT_DATA_PATH="$COMPAT" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM
 # under Wine (crashes on VMs/some drivers -> "Failed to initialize: ERR_FAILED").
 if [ "${SHINRI_HUB_GPU:-0}" != 1 ]; then set -- --disable-gpu "$@"; fi
 export SteamAppId="$APPID" SteamGameId="$APPID"
+# Steam's overlay and game recording need gameoverlayrenderer.so preloaded, which Steam only
+# does for games it launches itself. Without it the Vulkan overlay layer loads but can't hand
+# frames to Steam, so recordings get audio but no video. Steam lists both the 32- and 64-bit
+# copies; the loader skips the wrong-class one with a harmless warning.
+OVERLAY_PRELOAD=""
+for so in "$STEAM/ubuntu12_32/gameoverlayrenderer.so" "$STEAM/ubuntu12_64/gameoverlayrenderer.so"; do
+  [ -f "$so" ] && OVERLAY_PRELOAD="${OVERLAY_PRELOAD:+$OVERLAY_PRELOAD:}$so"
+done
+[ -n "$OVERLAY_PRELOAD" ] && export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$OVERLAY_PRELOAD"
 echo "--- $(date) launching $*" >>"$LOG"
 if [ "$STEAM_KIND" = flatpak ]; then
   exec flatpak run --command="$PROTON/proton" \
     --env=STEAM_COMPAT_DATA_PATH="$COMPAT" --env=STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM" \
     --env=SteamAppId="$APPID" --env=SteamGameId="$APPID" \
+    ${OVERLAY_PRELOAD:+--env=LD_PRELOAD="$OVERLAY_PRELOAD"} \
     com.valvesoftware.Steam run cmd /c 'C:\Program Files\Shinri Hub Linux\launch.bat' "$@" >>"$LOG" 2>&1
 fi
 # If a previous hub is still shutting down, starting a new one at the same moment can fail
